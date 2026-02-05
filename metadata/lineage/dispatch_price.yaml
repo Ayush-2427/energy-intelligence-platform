@@ -1,0 +1,30 @@
+dataset: dispatch_price
+
+source:
+  system: AEMO NEMWeb
+  path: /Reports/Current/Dispatch_Reports/
+  format: CSV (zipped)
+  update_frequency: 5 minutes
+
+ingestion:
+  method: file-based download over HTTPS
+  trigger: scheduled (future)
+  raw_retention: ephemeral (deleted after processing)
+
+processing:
+  extract_table: DREGION
+  filter_columns:
+    - SETTLEMENTDATE
+    - REGIONID
+    - RRP
+    - INTERVENTION
+    - RUNNO
+
+outputs:
+  clean_dataset: dispatch_price_clean
+  storage:
+    - local parquet (development)
+    - database table (future)
+
+owners:
+  developer: Ayush

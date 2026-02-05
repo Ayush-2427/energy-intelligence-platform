@@ -1,0 +1,13 @@
+{
+  "dataset": "dispatch_price",
+  "source": "AEMO NEMWeb",
+  "grain": "5-minute interval per region",
+  "primary_keys": ["settlement_date", "region_id"],
+  "fields": [
+    { "name": "settlement_date", "type": "timestamp" },
+    { "name": "region_id", "type": "string" },
+    { "name": "rrp", "type": "float" },
+    { "name": "intervention", "type": "boolean" },
+    { "name": "run_no", "type": "integer" }
+  ]
+}
