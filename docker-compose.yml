@@ -1,0 +1,15 @@
+services:
+  energy-pipeline:
+    image: energy-pipeline:latest
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+    environment:
+      RAW_DIR: data/raw/dispatch_inbox
+      AEMO_REPORT: DispatchIS_Reports
+      LOG_LEVEL: INFO
+      INGEST_LIMIT: "50"
+      PROCESS_MAX_FILES: "50"
+    volumes:
+      - ./data:/app/data
+    command: ["ingest_process"]
