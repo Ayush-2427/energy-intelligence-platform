@@ -28,7 +28,7 @@ def _sha256_dir(path: Path) -> Tuple[str, int]:
     total_size = 0
 
     base = path.resolve()
-    files = sorted([p for p in base.rglob("*") if p.is_file()])
+    files = sorted(p for p in base.rglob("*") if p.is_file())
 
     for f in files:
         rel = str(f.relative_to(base)).replace("\\", "/").encode("utf-8")
@@ -70,8 +70,10 @@ class MetadataStore:
         with get_conn() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
             cur.execute(
                 """
-                insert into pipeline_run (command, status, rows_appended, started_at, raw_dir, max_files, cleanup)
-                values (%s, 'running', 0, now(), %s, %s, %s)
+                insert into pipeline_run
+                    (command, status, rows_appended, started_at, raw_dir, max_files, cleanup)
+                values
+                    (%s, 'running', 0, now(), %s, %s, %s)
                 returning id
                 """,
                 (command, raw_dir, max_files, cleanup),
@@ -111,17 +113,20 @@ class MetadataStore:
         path_str = str(file_path.resolve())
 
         with get_conn() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
-            # Prefer schema with size_bytes
             try:
                 cur.execute(
                     """
-                    insert into raw_object (run_id, source_type, path, filename, size_bytes, sha256, discovered_at)
-                    values (%s, %s, %s, %s, %s, %s, now())
-                    on conflict (source_type, sha256) do update
-                      set path = excluded.path,
-                          filename = excluded.filename,
-                          size_bytes = excluded.size_bytes,
-                          discovered_at = excluded.discovered_at
+                    insert into raw_object
+                        (run_id, source_type, path, filename, size_bytes, sha256, discovered_at)
+                    values
+                        (%s, %s, %s, %s, %s, %s, now())
+                    on conflict (source_type, sha256)
+                        where (sha256 is not null)
+                    do update set
+                        path = excluded.path,
+                        filename = excluded.filename,
+                        size_bytes = excluded.size_bytes,
+                        discovered_at = excluded.discovered_at
                     returning id
                     """,
                     (run_id, source_type, path_str, file_path.name, size, sha),
@@ -130,12 +135,16 @@ class MetadataStore:
                 conn.rollback()
                 cur.execute(
                     """
-                    insert into raw_object (run_id, source_type, path, filename, sha256, discovered_at)
-                    values (%s, %s, %s, %s, %s, now())
-                    on conflict (source_type, sha256) do update
-                      set path = excluded.path,
-                          filename = excluded.filename,
-                          discovered_at = excluded.discovered_at
+                    insert into raw_object
+                        (run_id, source_type, path, filename, sha256, discovered_at)
+                    values
+                        (%s, %s, %s, %s, %s, now())
+                    on conflict (source_type, sha256)
+                        where (sha256 is not null)
+                    do update set
+                        path = excluded.path,
+                        filename = excluded.filename,
+                        discovered_at = excluded.discovered_at
                     returning id
                     """,
                     (run_id, source_type, path_str, file_path.name, sha),
@@ -153,7 +162,6 @@ class MetadataStore:
     ) -> str:
         """
         File or directory artifacts only.
-        This hashes the filesystem path, so it must exist.
         For DB artifacts, use register_db_artifact().
         """
         if not path.exists():
@@ -166,8 +174,10 @@ class MetadataStore:
             try:
                 cur.execute(
                     """
-                    insert into artifact (run_id, type, path, content_hash, size_bytes, created_at)
-                    values (%s, %s, %s, %s, %s, now())
+                    insert into artifact
+                        (run_id, type, path, content_hash, size_bytes, created_at)
+                    values
+                        (%s, %s, %s, %s, %s, now())
                     returning id
                     """,
                     (run_id, artifact_type, path_str, content_hash, size_bytes),
@@ -176,8 +186,10 @@ class MetadataStore:
                 conn.rollback()
                 cur.execute(
                     """
-                    insert into artifact (run_id, type, path, content_hash, created_at)
-                    values (%s, %s, %s, %s, now())
+                    insert into artifact
+                        (run_id, type, path, content_hash, created_at)
+                    values
+                        (%s, %s, %s, %s, now())
                     returning id
                     """,
                     (run_id, artifact_type, path_str, content_hash),
@@ -194,17 +206,18 @@ class MetadataStore:
         table_name: str,
     ) -> str:
         """
-        Record a database object as an artifact without filesystem hashing.
-        Stores path like: db://public.dispatch_price_5min_region
+        Record a database object as an artifact.
+        Stored as: db://public.table_name
         """
         path_str = f"db://{table_name}"
 
         with get_conn() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
-            # Do not set content_hash/size_bytes for DB objects
             cur.execute(
                 """
-                insert into artifact (run_id, type, path, content_hash, created_at)
-                values (%s, %s, %s, null, now())
+                insert into artifact
+                    (run_id, type, path, content_hash, created_at)
+                values
+                    (%s, %s, %s, null, now())
                 returning id
                 """,
                 (run_id, artifact_type, path_str),
@@ -223,8 +236,10 @@ class MetadataStore:
         with get_conn() as conn, conn.cursor() as cur:
             cur.execute(
                 """
-                insert into lineage_edge (run_id, from_type, from_id, to_type, to_id)
-                values (%s, %s, %s, 'artifact', %s)
+                insert into lineage_edge
+                    (run_id, from_type, from_id, to_type, to_id)
+                values
+                    (%s, %s, %s, 'artifact', %s)
                 on conflict do nothing
                 """,
                 (run_id, from_type, from_id, to_id),
