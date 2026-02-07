@@ -1,4 +1,20 @@
 services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_DB: energy
+      POSTGRES_USER: energy
+      POSTGRES_PASSWORD: energy
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U energy -d energy"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
   energy-pipeline:
     image: energy-pipeline:latest
     build:
@@ -10,6 +26,15 @@ services:
       LOG_LEVEL: INFO
       INGEST_LIMIT: "50"
       PROCESS_MAX_FILES: "50"
+      DATABASE_URL: postgresql://energy:energy@postgres:5432/energy
+    depends_on:
+      postgres:
+        condition: service_healthy
     volumes:
       - ./data:/app/data
+      - ./scripts:/app/scripts
+      - ./metadata:/app/metadata
     command: ["ingest_process"]
+
+volumes:
+  pgdata:
