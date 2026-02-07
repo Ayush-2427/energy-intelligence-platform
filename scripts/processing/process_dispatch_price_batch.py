@@ -1,16 +1,24 @@
+from __future__ import annotations
+
 import argparse
 import csv
 import os
+import re
 import shutil
 import tempfile
 import zipfile
 from pathlib import Path
-from typing import Dict, Optional, Set, Tuple
+from typing import Dict, Optional, Tuple
+
+from scripts.utilities.dispatch_price_repo import upsert_dispatch_prices
+from scripts.utilities.metadata_store import MetadataStore
+from scripts.utilities.watermark_store import get_watermark, set_watermark
 
 
 DEFAULT_RAW_DIR = Path("data/raw/dispatch_inbox")
-OUTPUT_DIR = Path("data/clean/dispatch_price")
-OUTPUT_FILE = OUTPUT_DIR / "dispatch_price_clean_batch.csv"
+
+WATERMARK_KEY = "dispatch_price_zip_ts"
+ZIP_TS_RE = re.compile(r"PUBLIC_DISPATCHIS_(\d{12})_")
 
 
 def resolve_raw_dir(cli_raw_dir: str | None) -> Path:
@@ -34,34 +42,14 @@ def pick(mapping: Dict[str, int], *candidates: str) -> Optional[int]:
     return None
 
 
-def key_tuple(row: dict) -> Tuple[str, str, str, str]:
-    return (
-        str(row["settlement_date"]),
-        str(row["region_id"]),
-        str(row["run_no"]),
-        str(row["intervention"]),
-    )
-
-
-def load_existing_keys(path: Path) -> Set[Tuple[str, str, str, str]]:
-    if not path.exists():
-        return set()
-
-    keys: Set[Tuple[str, str, str, str]] = set()
-    with path.open("r", encoding="utf-8", newline="") as f:
-        reader = csv.DictReader(f)
-        for r in reader:
-            if not r or "settlement_date" not in r:
-                continue
-            keys.add(
-                (
-                    r.get("settlement_date", ""),
-                    r.get("region_id", ""),
-                    r.get("run_no", ""),
-                    r.get("intervention", ""),
-                )
-            )
-    return keys
+def parse_zip_ts(zip_filename: str) -> Optional[str]:
+    """
+    Extract YYYYMMDDHHMM from filename. Returns string like '202602052110' or None.
+    """
+    m = ZIP_TS_RE.search(zip_filename)
+    if not m:
+        return None
+    return m.group(1)
 
 
 def process_csv_with_schema(csv_path: Path) -> list[dict]:
@@ -153,37 +141,45 @@ def extract_csvs_from_zip(zip_path: Path, extract_dir: Path) -> list[Path]:
     return sorted(extracted)
 
 
-def append_rows(path: Path, rows: list[dict]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
+def try_start_metadata_run(
+    store: Optional[MetadataStore],
+    raw_dir: Path,
+    max_files: Optional[int],
+    cleanup: bool,
+) -> tuple[Optional[MetadataStore], Optional[str]]:
+    if not store:
+        return None, None
 
-    file_exists = path.exists()
-    with path.open("a", encoding="utf-8", newline="") as f:
-        writer = csv.DictWriter(
-            f,
-            fieldnames=["settlement_date", "region_id", "rrp", "intervention", "run_no"],
-        )
-        if not file_exists:
-            writer.writeheader()
-
-        for r in rows:
-            writer.writerow(
-                {
-                    "settlement_date": r["settlement_date"],
-                    "region_id": r["region_id"],
-                    "rrp": r["rrp"],
-                    "intervention": r["intervention"],
-                    "run_no": r["run_no"],
-                }
-            )
+    try:
+        run_id = store.start_run(command="batch_db", raw_dir=str(raw_dir), max_files=max_files, cleanup=cleanup)
+        return store, run_id
+    except Exception as e:
+        print(f"Metadata disabled (failed to start run): {e}")
+        return None, None
 
 
 def main(raw_dir: Path, cleanup: bool, max_files: int | None) -> None:
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     raw_dir.mkdir(parents=True, exist_ok=True)
 
-    existing_keys = load_existing_keys(OUTPUT_FILE)
-    if existing_keys:
-        print(f"Existing output rows: {len(existing_keys)} (used for dedupe)")
+    # Read watermark (YYYYMMDDHHMM string)
+    watermark = get_watermark(WATERMARK_KEY)
+    if watermark:
+        print(f"Watermark: {WATERMARK_KEY}={watermark}")
+    else:
+        print(f"Watermark: {WATERMARK_KEY} is not set (first run behavior)")
+
+    # Optional metadata tracking
+    store: Optional[MetadataStore] = None
+    run_id: Optional[str] = None
+
+    try:
+        if os.getenv("DATABASE_URL"):
+            store = MetadataStore()
+    except Exception as e:
+        print(f"Metadata disabled (DB unavailable): {e}")
+        store = None
+
+    store, run_id = try_start_metadata_run(store, raw_dir, max_files, cleanup)
 
     csv_files, zip_files = list_inbox_files(raw_dir)
 
@@ -195,45 +191,83 @@ def main(raw_dir: Path, cleanup: bool, max_files: int | None) -> None:
 
     if not csv_files and not zip_files:
         print(f"No dispatch CSV or ZIP files found in: {raw_dir}")
+        if store and run_id:
+            store.finish_run(run_id, status="success", rows_appended=0, error_message=None)
         return
 
-    new_rows: list[dict] = []
     processed_csv_files: list[Path] = []
     processed_zip_files: list[Path] = []
-
     processed_count = 0
 
-    with tempfile.TemporaryDirectory(prefix="aemo_dispatch_extract_") as tmp_dir_str:
-        tmp_dir = Path(tmp_dir_str)
+    total_rows_parsed = 0
+    total_inserted = 0
+    total_updated = 0
 
-        try:
+    # Track max ZIP ts processed this run, to advance watermark at end
+    max_zip_ts_processed: Optional[str] = None
+
+    try:
+        with tempfile.TemporaryDirectory(prefix="aemo_dispatch_extract_") as tmp_dir_str:
+            tmp_dir = Path(tmp_dir_str)
+
+            # 1) Loose CSVs (no watermark logic, because watermark is for ZIP filenames)
             for i, csv_file in enumerate(csv_files, start=1):
                 if max_files is not None and processed_count >= max_files:
                     print("Reached max files cap. Stopping early.")
                     break
 
                 print(f"[CSV {i}/{len(csv_files)}] Processing: {csv_file.name}")
+
+                if store and run_id:
+                    try:
+                        store.register_raw_object(run_id, "csv", csv_file)
+                    except Exception as e:
+                        print(f"Metadata warn: could not register raw csv: {e}")
+
                 rows = process_csv_with_schema(csv_file)
+                total_rows_parsed += len(rows)
 
-                kept = 0
-                for r in rows:
-                    kt = key_tuple(r)
-                    if kt not in existing_keys:
-                        existing_keys.add(kt)
-                        new_rows.append(r)
-                        kept += 1
+                inserted, updated = upsert_dispatch_prices(rows)
+                total_inserted += inserted
+                total_updated += updated
+                print(f"  Parsed: {len(rows)} | Inserted: {inserted} | Updated: {updated}")
 
-                # Always mark as processed if we successfully read it
                 processed_csv_files.append(csv_file)
-
                 processed_count += 1
 
+            # 2) ZIPs with watermark
             for j, zip_file in enumerate(zip_files, start=1):
                 if max_files is not None and processed_count >= max_files:
                     print("Reached max files cap. Stopping early.")
                     break
 
+                zip_ts = parse_zip_ts(zip_file.name)
                 print(f"[ZIP {j}/{len(zip_files)}] Extracting: {zip_file.name}")
+
+                # Fast skip by watermark if we can parse timestamp
+                if watermark and zip_ts and zip_ts <= watermark:
+                    print("  Skipping (older than or equal to watermark)")
+                    continue
+
+                # Register raw zip (this also gives you sha dedupe behavior, if you implemented it there)
+                already_ingested = False
+                if store and run_id:
+                    try:
+                        # If your MetadataStore.register_raw_object has sha unique constraint handling,
+                        # it should raise or return a signal. If not, we still proceed and sha dedupe
+                        # may happen elsewhere.
+                        store.register_raw_object(run_id, "zip", zip_file)
+                    except Exception as e:
+                        # If your MetadataStore raises something like "already exists", treat as skip
+                        msg = str(e).lower()
+                        if "already ingested" in msg or "duplicate" in msg or "unique" in msg:
+                            already_ingested = True
+                        else:
+                            print(f"Metadata warn: could not register raw zip: {e}")
+
+                if already_ingested:
+                    print("  Skipping (already ingested by sha256)")
+                    continue
 
                 extracted_dir = tmp_dir / zip_file.stem
                 extracted_dir.mkdir(parents=True, exist_ok=True)
@@ -241,60 +275,73 @@ def main(raw_dir: Path, cleanup: bool, max_files: int | None) -> None:
                 extracted_csvs = extract_csvs_from_zip(zip_file, extracted_dir)
                 if not extracted_csvs:
                     print("  No CSVs in this zip. Skipping.")
-                    # Still mark the zip as processed so cleanup can delete it if requested
                     processed_zip_files.append(zip_file)
                     processed_count += 1
                     continue
 
-                zip_kept = 0
+                zip_parsed = 0
+                zip_inserted = 0
+                zip_updated = 0
+
                 for k, extracted_csv in enumerate(extracted_csvs, start=1):
                     print(f"  [ZIP CSV {k}/{len(extracted_csvs)}] Reading: {extracted_csv.name}")
                     rows = process_csv_with_schema(extracted_csv)
-                    for r in rows:
-                        kt = key_tuple(r)
-                        if kt not in existing_keys:
-                            existing_keys.add(kt)
-                            new_rows.append(r)
-                            zip_kept += 1
+                    zip_parsed += len(rows)
 
-                # Always mark the zip as processed if we could open it
+                    inserted, updated = upsert_dispatch_prices(rows)
+                    zip_inserted += inserted
+                    zip_updated += updated
+
+                total_rows_parsed += zip_parsed
+                total_inserted += zip_inserted
+                total_updated += zip_updated
+
+                print(f"  Parsed from zip: {zip_parsed} | Inserted: {zip_inserted} | Updated: {zip_updated}")
+
+                # Advance max zip ts processed if we ingested anything or even just attempted processing
+                if zip_ts:
+                    if (max_zip_ts_processed is None) or (zip_ts > max_zip_ts_processed):
+                        max_zip_ts_processed = zip_ts
+
                 processed_zip_files.append(zip_file)
-
-                if zip_kept > 0:
-                    print(f"  Added {zip_kept} new rows from this zip")
-                else:
-                    print("  No new rows from this zip (all duplicates or no region price rows)")
-
                 processed_count += 1
 
-            if new_rows:
-                append_rows(OUTPUT_FILE, new_rows)
-                print(f"Appended new rows: {len(new_rows)}")
-                print(f"Output file: {OUTPUT_FILE}")
-            else:
-                print("No new rows to append. Output unchanged.")
+        if cleanup:
+            for file in processed_csv_files:
+                file.unlink(missing_ok=True)
+            for file in processed_zip_files:
+                file.unlink(missing_ok=True)
+            print("Cleanup complete.")
+        else:
+            print("Raw files kept (no cleanup).")
 
-            # Cleanup must run even if there were 0 new rows
-            if cleanup:
-                for file in processed_csv_files:
-                    file.unlink(missing_ok=True)
-                for file in processed_zip_files:
-                    file.unlink(missing_ok=True)
-                print("Cleanup complete.")
-            else:
-                print("Raw files kept (no cleanup).")
+        # Advance watermark only if we processed newer zip timestamps
+        if max_zip_ts_processed:
+            set_watermark(WATERMARK_KEY, max_zip_ts_processed)
+            print(f"Watermark advanced: {WATERMARK_KEY}={max_zip_ts_processed}")
 
-        except KeyboardInterrupt:
-            print("Interrupted by user. Raw files were NOT deleted.")
-            raise
-        except Exception:
-            print("ERROR: Batch processing failed.")
-            print("Raw files were NOT deleted.")
-            raise
+        # Record run result
+        rows_appended = total_inserted + total_updated
+        if store and run_id:
+            store.finish_run(run_id, status="success", rows_appended=rows_appended, error_message=None)
+
+        print(f"Done. Parsed: {total_rows_parsed} | Inserted: {total_inserted} | Updated: {total_updated}")
+
+    except KeyboardInterrupt:
+        print("Interrupted by user. Raw files were NOT deleted.")
+        if store and run_id:
+            store.finish_run(run_id, status="failed", rows_appended=(total_inserted + total_updated), error_message="KeyboardInterrupt")
+        raise
+    except Exception as e:
+        print("ERROR: Batch processing failed.")
+        print("Raw files were NOT deleted.")
+        if store and run_id:
+            store.finish_run(run_id, status="failed", rows_appended=(total_inserted + total_updated), error_message=str(e))
+        raise
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Batch process AEMO dispatch price CSV and ZIP files")
+    parser = argparse.ArgumentParser(description="Batch process AEMO dispatch price CSV and ZIP files (DB-first + watermark)")
     parser.add_argument(
         "--raw-dir",
         type=str,
