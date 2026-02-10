@@ -8,7 +8,7 @@ import shutil
 import tempfile
 import zipfile
 from pathlib import Path
-from typing import Dict, Optional, Tuple
+from typing import Dict, Optional
 
 from scripts.utilities.dispatch_price_repo import upsert_dispatch_prices
 from scripts.utilities.metadata_store import MetadataStore
@@ -17,7 +17,11 @@ from scripts.utilities.watermark_store import get_watermark, set_watermark
 
 DEFAULT_RAW_DIR = Path("data/raw/dispatch_inbox")
 
-WATERMARK_KEY = "dispatch_price_zip_ts"
+# Important: processor watermark is NOT the pull watermark.
+# - dispatch_price_zip_ts: "latest downloaded" (ingestion/pull step)
+# - dispatch_price_processed_ts: "latest successfully processed" (this step)
+PROCESSED_WATERMARK_KEY = "dispatch_price_processed_ts"
+
 ZIP_TS_RE = re.compile(r"PUBLIC_DISPATCHIS_(\d{12})_")
 
 
@@ -44,12 +48,40 @@ def pick(mapping: Dict[str, int], *candidates: str) -> Optional[int]:
 
 def parse_zip_ts(zip_filename: str) -> Optional[str]:
     """
-    Extract YYYYMMDDHHMM from filename. Returns string like '202602052110' or None.
+    Extract YYYYMMDDHHMM from filename. Returns string like '202602060645' or None.
     """
     m = ZIP_TS_RE.search(zip_filename)
     if not m:
         return None
     return m.group(1)
+
+
+def _to_yyyymmddhhmm(value: Optional[str]) -> Optional[str]:
+    """
+    Normalize watermark values to YYYYMMDDHHMM so lexicographic compare works.
+
+    Accepts:
+    - "YYYYMMDDHHMM"
+    - ISO-like "YYYY-MM-DD HH:MM:SS" or "YYYY-MM-DDTHH:MM:SS"
+    """
+    if not value:
+        return None
+
+    s = str(value).strip()
+    if not s:
+        return None
+
+    # Already in compact form
+    if re.fullmatch(r"\d{12}", s):
+        return s
+
+    # ISO-ish: take first 16 chars "YYYY-MM-DD HH:MM" or "YYYY-MM-DDTHH:MM"
+    m = re.match(r"^(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2})", s)
+    if m:
+        yyyy, mm, dd, hh, mi = m.groups()
+        return f"{yyyy}{mm}{dd}{hh}{mi}"
+
+    return None
 
 
 def process_csv_with_schema(csv_path: Path) -> list[dict]:
@@ -161,14 +193,14 @@ def try_start_metadata_run(
 def main(raw_dir: Path, cleanup: bool, max_files: int | None) -> None:
     raw_dir.mkdir(parents=True, exist_ok=True)
 
-    # Read watermark (YYYYMMDDHHMM string)
-    watermark = get_watermark(WATERMARK_KEY)
-    if watermark:
-        print(f"Watermark: {WATERMARK_KEY}={watermark}")
-    else:
-        print(f"Watermark: {WATERMARK_KEY} is not set (first run behavior)")
+    watermark_raw = get_watermark(PROCESSED_WATERMARK_KEY)
+    processed_gate = _to_yyyymmddhhmm(watermark_raw)
 
-    # Optional metadata tracking
+    if processed_gate:
+        print(f"Watermark: {PROCESSED_WATERMARK_KEY}={processed_gate}")
+    else:
+        print(f"Watermark: {PROCESSED_WATERMARK_KEY} is not set (first run behavior)")
+
     store: Optional[MetadataStore] = None
     run_id: Optional[str] = None
 
@@ -203,14 +235,13 @@ def main(raw_dir: Path, cleanup: bool, max_files: int | None) -> None:
     total_inserted = 0
     total_updated = 0
 
-    # Track max ZIP ts processed this run, to advance watermark at end
     max_zip_ts_processed: Optional[str] = None
 
     try:
         with tempfile.TemporaryDirectory(prefix="aemo_dispatch_extract_") as tmp_dir_str:
             tmp_dir = Path(tmp_dir_str)
 
-            # 1) Loose CSVs (no watermark logic, because watermark is for ZIP filenames)
+            # 1) Loose CSVs: do not change processed watermark based on loose CSVs
             for i, csv_file in enumerate(csv_files, start=1):
                 if max_files is not None and processed_count >= max_files:
                     print("Reached max files cap. Stopping early.")
@@ -235,7 +266,7 @@ def main(raw_dir: Path, cleanup: bool, max_files: int | None) -> None:
                 processed_csv_files.append(csv_file)
                 processed_count += 1
 
-            # 2) ZIPs with watermark
+            # 2) ZIPs: watermark gate uses PROCESSED watermark, not ZIP watermark
             for j, zip_file in enumerate(zip_files, start=1):
                 if max_files is not None and processed_count >= max_files:
                     print("Reached max files cap. Stopping early.")
@@ -244,21 +275,17 @@ def main(raw_dir: Path, cleanup: bool, max_files: int | None) -> None:
                 zip_ts = parse_zip_ts(zip_file.name)
                 print(f"[ZIP {j}/{len(zip_files)}] Extracting: {zip_file.name}")
 
-                # Fast skip by watermark if we can parse timestamp
-                if watermark and zip_ts and zip_ts <= watermark:
-                    print("  Skipping (older than or equal to watermark)")
+                # Gate by processed watermark
+                if processed_gate and zip_ts and zip_ts <= processed_gate:
+                    print("  Skipping (older than or equal to processed watermark)")
                     continue
 
-                # Register raw zip (this also gives you sha dedupe behavior, if you implemented it there)
+                # Register raw zip and dedupe by sha
                 already_ingested = False
                 if store and run_id:
                     try:
-                        # If your MetadataStore.register_raw_object has sha unique constraint handling,
-                        # it should raise or return a signal. If not, we still proceed and sha dedupe
-                        # may happen elsewhere.
                         store.register_raw_object(run_id, "zip", zip_file)
                     except Exception as e:
-                        # If your MetadataStore raises something like "already exists", treat as skip
                         msg = str(e).lower()
                         if "already ingested" in msg or "duplicate" in msg or "unique" in msg:
                             already_ingested = True
@@ -267,6 +294,7 @@ def main(raw_dir: Path, cleanup: bool, max_files: int | None) -> None:
 
                 if already_ingested:
                     print("  Skipping (already ingested by sha256)")
+                    # Even if we skip, we should NOT advance processed watermark
                     continue
 
                 extracted_dir = tmp_dir / zip_file.stem
@@ -298,7 +326,6 @@ def main(raw_dir: Path, cleanup: bool, max_files: int | None) -> None:
 
                 print(f"  Parsed from zip: {zip_parsed} | Inserted: {zip_inserted} | Updated: {zip_updated}")
 
-                # Advance max zip ts processed if we ingested anything or even just attempted processing
                 if zip_ts:
                     if (max_zip_ts_processed is None) or (zip_ts > max_zip_ts_processed):
                         max_zip_ts_processed = zip_ts
@@ -315,12 +342,11 @@ def main(raw_dir: Path, cleanup: bool, max_files: int | None) -> None:
         else:
             print("Raw files kept (no cleanup).")
 
-        # Advance watermark only if we processed newer zip timestamps
+        # Advance PROCESSED watermark only based on ZIPs actually processed
         if max_zip_ts_processed:
-            set_watermark(WATERMARK_KEY, max_zip_ts_processed)
-            print(f"Watermark advanced: {WATERMARK_KEY}={max_zip_ts_processed}")
+            set_watermark(PROCESSED_WATERMARK_KEY, max_zip_ts_processed)
+            print(f"Watermark advanced: {PROCESSED_WATERMARK_KEY}={max_zip_ts_processed}")
 
-        # Record run result
         rows_appended = total_inserted + total_updated
         if store and run_id:
             store.finish_run(run_id, status="success", rows_appended=rows_appended, error_message=None)
@@ -330,13 +356,23 @@ def main(raw_dir: Path, cleanup: bool, max_files: int | None) -> None:
     except KeyboardInterrupt:
         print("Interrupted by user. Raw files were NOT deleted.")
         if store and run_id:
-            store.finish_run(run_id, status="failed", rows_appended=(total_inserted + total_updated), error_message="KeyboardInterrupt")
+            store.finish_run(
+                run_id,
+                status="failed",
+                rows_appended=(total_inserted + total_updated),
+                error_message="KeyboardInterrupt",
+            )
         raise
     except Exception as e:
         print("ERROR: Batch processing failed.")
         print("Raw files were NOT deleted.")
         if store and run_id:
-            store.finish_run(run_id, status="failed", rows_appended=(total_inserted + total_updated), error_message=str(e))
+            store.finish_run(
+                run_id,
+                status="failed",
+                rows_appended=(total_inserted + total_updated),
+                error_message=str(e),
+            )
         raise
 
 
