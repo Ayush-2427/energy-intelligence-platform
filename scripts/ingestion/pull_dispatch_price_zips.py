@@ -23,6 +23,7 @@ DEFAULT_TIMEOUT = (10, 120)
 DEFAULT_REPORT = "DispatchIS_Reports"
 BASE_NEMWEB_CURRENT = "https://www.nemweb.com.au/REPORTS/CURRENT/"
 
+# Pull watermark only
 WATERMARK_NAME = "dispatch_price_zip_ts"
 
 REPORT_PATTERNS = {
@@ -224,11 +225,9 @@ def load_db_watermark(name: str) -> Optional[datetime]:
         return None
 
     raw = str(row[0]).strip()
-    # Accept ISO "YYYY-MM-DD HH:MM:SS" or similar
     try:
         return datetime.fromisoformat(raw)
     except Exception:
-        # Fallback for "YYYYMMDDHHMM"
         try:
             return datetime.strptime(raw, "%Y%m%d%H%M")
         except Exception:
@@ -301,7 +300,10 @@ def main(argv: Optional[List[str]] = None) -> int:
     logging.info(f"Inbox dir: {paths.inbox_dir}")
     logging.info(f"Report: {report}")
     logging.info(f"Report URL: {base_url}")
-    logging.info(f"DB watermark {WATERMARK_NAME}: {watermark_dt.isoformat(sep=' ', timespec='minutes') if watermark_dt else 'None'}")
+    logging.info(
+        f"DB watermark {WATERMARK_NAME}: "
+        f"{watermark_dt.isoformat(sep=' ', timespec='minutes') if watermark_dt else 'None'}"
+    )
     logging.info(f"Gate: {gate_dt.isoformat(sep=' ', timespec='minutes') if gate_dt else 'None'}")
 
     if args.no_update_watermark:
@@ -331,7 +333,6 @@ def main(argv: Optional[List[str]] = None) -> int:
         logging.info("Nothing to do")
         return 0
 
-    # Optional: track the pull as a pipeline run
     store: Optional[MetadataStore] = None
     run_id: Optional[str] = None
     try:
@@ -362,7 +363,6 @@ def main(argv: Optional[List[str]] = None) -> int:
                 if dt is not None and (newest_dt is None or dt > newest_dt):
                     newest_dt = dt
 
-                # Register raw object (unique by sha256 is enforced now)
                 if store and run_id:
                     try:
                         store.register_raw_object(run_id, "zip", downloaded)
