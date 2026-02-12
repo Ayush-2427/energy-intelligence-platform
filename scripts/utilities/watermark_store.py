@@ -14,13 +14,14 @@ def get_watermark(name: str) -> Optional[str]:
     with get_conn() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
         cur.execute("select value from watermark_state where name = %s", (name,))
         row = cur.fetchone()
-        return row["value"] if row else None
+        return row["value"] if row and row.get("value") is not None else None
 
 
 def set_watermark(name: str, value: str) -> None:
     """
     Upserts watermark value.
     """
+    v = str(value).strip()
     with get_conn() as conn, conn.cursor() as cur:
         cur.execute(
             """
@@ -29,6 +30,6 @@ def set_watermark(name: str, value: str) -> None:
             on conflict (name)
             do update set value = excluded.value, updated_at = now()
             """,
-            (name, value),
+            (name, v),
         )
         conn.commit()
