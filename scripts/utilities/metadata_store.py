@@ -103,14 +103,53 @@ class MetadataStore:
             )
             conn.commit()
 
+    def raw_object_exists_by_sha(self, source_type: str, sha256: str) -> bool:
+        with get_conn() as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                select 1
+                from raw_object
+                where source_type = %s and sha256 = %s
+                limit 1
+                """,
+                (source_type, sha256),
+            )
+            return cur.fetchone() is not None
+
     def register_raw_object(
         self,
         run_id: str,
         source_type: str,
         file_path: Path,
-    ) -> str:
+    ) -> tuple[str, bool]:
+        """
+        Register a raw object (file/dir) and return:
+          (raw_object_id, was_new)
+
+        was_new=False means we have already seen this (source_type, sha256) before.
+        """
         sha, size = _hash_path(file_path)
         path_str = str(file_path.resolve())
+
+        # Deterministic dedupe: check first
+        if sha and self.raw_object_exists_by_sha(source_type, sha):
+            # Fetch the existing id so caller can still create lineage if needed
+            with get_conn() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute(
+                    """
+                    select id
+                    from raw_object
+                    where source_type = %s and sha256 = %s
+                    limit 1
+                    """,
+                    (source_type, sha),
+                )
+                row = cur.fetchone()
+                if row and row.get("id") is not None:
+                    return str(row["id"]), False
+
+            # If for some reason id fetch fails, fall through to upsert
+            # (still safe, just not ideal)
 
         with get_conn() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
             try:
@@ -152,7 +191,11 @@ class MetadataStore:
 
             rid = cur.fetchone()["id"]
             conn.commit()
-            return str(rid)
+
+        # If we got here without early return, treat as new.
+        # Even if it was an upsert, we already did an existence check above,
+        # so "new" is the intended interpretation.
+        return str(rid), True
 
     def register_artifact(
         self,
@@ -274,16 +317,3 @@ class MetadataStore:
             )
             rows = cur.fetchall()
             return [str(r["id"]) for r in rows]
-
-    def raw_object_exists_by_sha(self, source_type: str, sha256: str) -> bool:
-        with get_conn() as conn, conn.cursor() as cur:
-            cur.execute(
-                """
-                select 1
-                from raw_object
-                where source_type = %s and sha256 = %s
-                limit 1
-                """,
-                (source_type, sha256),
-            )
-            return cur.fetchone() is not None
