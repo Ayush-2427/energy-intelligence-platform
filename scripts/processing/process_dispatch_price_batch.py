@@ -183,8 +183,11 @@ def try_start_metadata_run(
         return None, None
 
     try:
-        run_id = store.start_run(command="batch_db", raw_dir=str(raw_dir), max_files=max_files, cleanup=cleanup)
+        run_id = store.start_run(command="process_dispatch_price", raw_dir=str(raw_dir),
+                         max_files=max_files, cleanup=cleanup)
+
         return store, run_id
+    
     except Exception as e:
         print(f"Metadata disabled (failed to start run): {e}")
         return None, None

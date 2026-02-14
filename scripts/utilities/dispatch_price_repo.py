@@ -1,63 +1,65 @@
-# scripts/utilities/dispatch_price_repo.py
 from __future__ import annotations
 
-from typing import Iterable, Tuple
+from typing import Dict, List, Tuple
 
-from psycopg2.extras import execute_values
+import psycopg2.extras
 
 from scripts.utilities.db import get_conn
 
 
-# We mark whether row was inserted or updated:
-# In Postgres, xmax = 0 typically means "inserted in this statement", otherwise it was updated.
-# Important: the WHERE clause avoids pointless updates when rrp did not change.
-UPSERT_RETURNING_SQL = """
-insert into dispatch_price (settlement_date, region_id, rrp, intervention, run_no)
-values %s
-on conflict (settlement_date, region_id, run_no, intervention)
-do update set
-  rrp = excluded.rrp,
-  ingested_at = now()
-where dispatch_price.rrp is distinct from excluded.rrp
-returning (xmax = 0) as inserted;
-"""
-
-
-def upsert_dispatch_prices(rows: Iterable[dict]) -> Tuple[int, int]:
+def upsert_dispatch_prices(rows: List[Dict]) -> Tuple[int, int]:
     """
-    Returns (inserted_count, updated_count)
+    Upserts dispatch price rows and returns (inserted_count, updated_count).
 
-    Notes:
-      - If a row already exists and rrp is the same, no update happens.
-      - If rrp differs, we update rrp and ingested_at.
+    Counting is done using RETURNING (xmax = 0) which is accurate for:
+    - inserted rows: xmax = 0
+    - conflict-updated rows: xmax != 0
     """
-    rows_list = list(rows)
-    if not rows_list:
-        return (0, 0)
+    if not rows:
+        return 0, 0
 
-    payload = [
+    sql = """
+        insert into dispatch_price (
+            settlement_date,
+            region_id,
+            run_no,
+            intervention,
+            rrp
+        )
+        values %s
+        on conflict (settlement_date, region_id, run_no, intervention)
+        do update set
+            rrp = excluded.rrp
+        returning (xmax = 0) as inserted;
+    """
+
+    values = [
         (
             r["settlement_date"],
             r["region_id"],
-            float(r["rrp"]),
-            int(r.get("intervention", 0)),
-            int(r.get("run_no", 0)),
+            r["run_no"],
+            r["intervention"],
+            r["rrp"],
         )
-        for r in rows_list
+        for r in rows
     ]
 
-    inserted = 0
-    updated = 0
-
-    with get_conn() as conn, conn.cursor() as cur:
-        execute_values(cur, UPSERT_RETURNING_SQL, payload, page_size=5000)
-        results = cur.fetchall()
+    conn = get_conn()
+    try:
+        with conn.cursor() as cur:
+            psycopg2.extras.execute_values(
+                cur,
+                sql,
+                values,
+                page_size=5000,
+            )
+            result = cur.fetchall()
+            inserted = sum(1 for (flag,) in result if flag)
+            updated = len(result) - inserted
         conn.commit()
-
-    for (was_inserted,) in results:
-        if was_inserted:
-            inserted += 1
-        else:
-            updated += 1
-
-    return (inserted, updated)
+        return inserted, updated
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()

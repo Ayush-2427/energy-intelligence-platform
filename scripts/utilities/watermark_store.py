@@ -1,35 +1,54 @@
+# scripts/utilities/watermark_store.py
 from __future__ import annotations
 
+import os
 from typing import Optional
 
-from psycopg2.extras import RealDictCursor
+import psycopg2
 
-from scripts.utilities.db import get_conn
+
+def _get_db_url() -> str:
+    url = os.getenv("DATABASE_URL", "").strip()
+    if not url:
+        raise RuntimeError("DATABASE_URL is not set")
+    return url
 
 
 def get_watermark(name: str) -> Optional[str]:
     """
-    Returns watermark value (string) or None if not set.
+    Reads watermark_state.value for a given watermark_state.name.
+    Returns None if not set.
     """
-    with get_conn() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
-        cur.execute("select value from watermark_state where name = %s", (name,))
-        row = cur.fetchone()
-        return row["value"] if row and row.get("value") is not None else None
+    db_url = _get_db_url()
+    with psycopg2.connect(db_url) as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                select value
+                from watermark_state
+                where name = %s
+                limit 1;
+                """,
+                (name,),
+            )
+            row = cur.fetchone()
+            return row[0] if row and row[0] is not None else None
 
 
 def set_watermark(name: str, value: str) -> None:
     """
-    Upserts watermark value.
+    Upserts watermark_state(name, value) and bumps updated_at.
     """
-    v = str(value).strip()
-    with get_conn() as conn, conn.cursor() as cur:
-        cur.execute(
-            """
-            insert into watermark_state (name, value, updated_at)
-            values (%s, %s, now())
-            on conflict (name)
-            do update set value = excluded.value, updated_at = now()
-            """,
-            (name, v),
-        )
+    db_url = _get_db_url()
+    with psycopg2.connect(db_url) as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                insert into watermark_state (name, value, updated_at)
+                values (%s, %s, now())
+                on conflict (name)
+                do update set value = excluded.value, updated_at = now();
+                """,
+                (name, str(value)),
+            )
         conn.commit()
