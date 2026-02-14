@@ -41,11 +41,20 @@ def already_applied(version: str) -> bool:
 
 
 def apply_file(path: Path) -> None:
-    sql = path.read_text(encoding="utf-8")
+    sql = path.read_text(encoding="utf-8").strip()
+
+    if not sql:
+        print(f"Skipping empty migration: {path.name}")
+        return
+
     with get_conn() as conn, conn.cursor() as cur:
         cur.execute(sql)
-        cur.execute("insert into schema_migrations(version) values (%s)", (path.name,))
+        cur.execute(
+            "insert into schema_migrations(version) values (%s)",
+            (path.name,),
+        )
         conn.commit()
+
 
 
 def main() -> None:
@@ -73,3 +82,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+

@@ -8,6 +8,9 @@ echo "Starting Energy Intelligence Pipeline"
 echo "Command: ${COMMAND}"
 echo "RAW_DIR: ${RAW_DIR:-data/raw/dispatch_inbox}"
 
+# Ensure project root is on Python import path
+export PYTHONPATH="${PYTHONPATH:-/app}"
+
 INGEST_ARGS=()
 PROCESS_ARGS=()
 
@@ -16,7 +19,6 @@ DEFAULT_REPORT="${AEMO_REPORT:-DispatchIS_Reports}"
 DEFAULT_INGEST_LIMIT="${INGEST_LIMIT:-50}"
 DEFAULT_PROCESS_MAX_FILES="${PROCESS_MAX_FILES:-50}"
 
-# Track whether user provided these explicitly
 HAS_LIMIT=0
 HAS_MAX_FILES=0
 
@@ -81,48 +83,60 @@ if [[ $HAS_MAX_FILES -eq 0 ]]; then
 fi
 
 case "$COMMAND" in
+  migrate)
+    echo "Running DB migrations"
+    python -m scripts.migrations.migrate
+    ;;
+
   ingest)
     echo "Running ingestion only"
-    python scripts/ingestion/ingest_dispatch.py --report "${DEFAULT_REPORT}" "${INGEST_ARGS[@]}"
+    python -m scripts.ingestion.ingest_dispatch --report "${DEFAULT_REPORT}" "${INGEST_ARGS[@]}"
     ;;
 
   batch)
-    echo "Running processing only"
-    python scripts/processing/process_dispatch_price_batch.py "${PROCESS_ARGS[@]}"
+    echo "Running processing only (batch processor)"
+    python -m scripts.processing.process_dispatch_price_batch "${PROCESS_ARGS[@]}"
     ;;
+
+  process_dispatch_price)
+    echo "Processing dispatch price into DB (incremental batch, metadata tables)"
+    python -m scripts.processing.process_dispatch_price_batch "${PROCESS_ARGS[@]}"
+    ;;
+
 
   ingest_process)
     echo "Ingest -> Process (with cleanup)"
-    python scripts/ingestion/ingest_dispatch.py --report "${DEFAULT_REPORT}" "${INGEST_ARGS[@]}"
+    python -m scripts.ingestion.ingest_dispatch --report "${DEFAULT_REPORT}" "${INGEST_ARGS[@]}"
 
     if [[ " ${PROCESS_ARGS[*]} " != *" --cleanup "* ]]; then
       PROCESS_ARGS+=(--cleanup)
     fi
 
-    python scripts/processing/process_dispatch_price_batch.py "${PROCESS_ARGS[@]}"
+    python -m scripts.processing.process_dispatch_price "${PROCESS_ARGS[@]}"
     ;;
 
   parquet)
     echo "Converting clean dataset to parquet"
-    python scripts/processing/convert_dispatch_price_clean_to_parquet.py
+    python -m scripts.processing.convert_dispatch_price_clean_to_parquet
     ;;
 
   rollups)
     echo "Building daily region rollups"
-    python scripts/processing/build_daily_region_rollups.py
+    python -m scripts.processing.build_daily_region_rollups
     ;;
 
   all)
-    echo "Full pipeline: ingest -> process -> parquet -> rollups"
-    python scripts/ingestion/ingest_dispatch.py --report "${DEFAULT_REPORT}" "${INGEST_ARGS[@]}"
+    echo "Full pipeline: migrate -> ingest -> process -> parquet -> rollups"
+    python -m scripts.migrations.migrate
+    python -m scripts.ingestion.ingest_dispatch --report "${DEFAULT_REPORT}" "${INGEST_ARGS[@]}"
 
     if [[ " ${PROCESS_ARGS[*]} " != *" --cleanup "* ]]; then
       PROCESS_ARGS+=(--cleanup)
     fi
 
-    python scripts/processing/process_dispatch_price_batch.py "${PROCESS_ARGS[@]}"
-    python scripts/processing/convert_dispatch_price_clean_to_parquet.py
-    python scripts/processing/build_daily_region_rollups.py
+    python -m scripts.processing.process_dispatch_price "${PROCESS_ARGS[@]}"
+    python -m scripts.processing.convert_dispatch_price_clean_to_parquet
+    python -m scripts.processing.build_daily_region_rollups
     ;;
 
   shell|bash)

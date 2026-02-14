@@ -26,7 +26,17 @@ services:
       LOG_LEVEL: INFO
       INGEST_LIMIT: "50"
       PROCESS_MAX_FILES: "50"
+
+      # keep this
       DATABASE_URL: postgresql://energy:energy@postgres:5432/energy
+
+      # add these (for any code that reads DB_* instead of DATABASE_URL)
+      DB_HOST: postgres
+      DB_PORT: "5432"
+      DB_NAME: energy
+      DB_USER: energy
+      DB_PASSWORD: energy
+
     depends_on:
       postgres:
         condition: service_healthy
